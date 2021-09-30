@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
-#include <sys/types.h>         
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -10,312 +10,217 @@
 #include <pthread.h>
 #include <fcntl.h>
 
-#define BUF_MAX_LEN         1024
-#define METHOD_MAX_LEN      10
-#define URL_MAX_LEN         512
-
-#define SERVER_OK            0
-#define ERR_ARGS            -1
-#define ERR_CLIENT_CLOSE    -2
-#define ERR_API             -3
-
+#define BUF_LEN_10B   10
+#define BUF_LEN_512B   512
+#define BUF_LEN_1KB   1024
 #define STDIN   0
 #define STDOUT  1
 #define STDERR  2
 typedef struct {
-    char *method;
-    char *url;
+    char method[BUF_LEN_10B];
+    char url[BUF_LEN_512B];
     size_t content_length;
-    char *data;
+    char data[BUF_LEN_1KB];
 } recvdata_t;
 
-
-void *accept_request(void *arg);
-static int send_header(int fd);
-static int send_html_file(int fd, char *path);
-static int send_cgi_file(int fd, char *path, recvdata_t *rdata);
-static int get_request(int fd, recvdata_t *rdata);
-static int get_data_length(int fd, recvdata_t *rdata);
-static int get_recv_data(int fd, recvdata_t *rdata);
-static ssize_t get_recv_line(int fd, char *buf, size_t len);
-static int discard_recv_data(int fd);
 static int startup(int port);
+void accept_request(void *arg);
+static size_t get_line(int client, char *buf, int len);
+static int get_data(int client, recvdata_t *recvdata);
+static int get_command(int client, recvdata_t *recvdata);
+static int set_html_file(int client, recvdata_t *recvdata);
+static int set_cgi_file(int client, recvdata_t *recvdata);
 
 void main()
 {
-    int sockfd = -1, fd = -1;
-    struct sockaddr_in cliaddr;
-    int addrlen = sizeof(cliaddr);
+    int server_sock = -1;
+    int client_sock = -1;
+    int port = 4000;
+    struct sockaddr_in client_addr;
+    size_t client_addr_len = sizeof(client_addr);
     pthread_t thread;
-    pid_t pid;
-    sockfd = startup(4000);
-    for (;;) {
-        if ((fd = accept(sockfd, (struct sockaddr *)&cliaddr, (socklen_t *)&addrlen)) < 0) {
+    
+    server_sock = startup(port);
+    printf("server port:%d\n", port);
+    while (1) {
+        if ((client_sock = accept(server_sock, (struct sockaddr *)&client_addr, (socklen_t *)&client_addr_len)) < 0) {
             perror("accept error");
             exit(1);
         }
-        printf("client address:%s port:%d\n", inet_ntoa(cliaddr.sin_addr), ntohs(cliaddr.sin_port));
+        printf("client address:%s port:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
         
-        if (pthread_create(&thread, NULL, accept_request, (void *)(intptr_t)fd) != 0) {
+        if (pthread_create(&thread, NULL, (void *)accept_request, (void *)(intptr_t)client_sock) != 0) {
             fprintf(stderr, "pthread_create error");
             exit(1);
         }
     }
-    close(sockfd);
+    close(server_sock);
 }
 
-void *accept_request(void *arg)
+void accept_request(void *arg)
 {
-    int fd = (intptr_t)arg;
-    char path[URL_MAX_LEN] = {'\0'};
-    recvdata_t recvdata = {NULL, NULL, 0, NULL};
-
-    if (get_request(fd, &recvdata) < 0) {
-        fprintf(stderr, "accept_request:get_request error");
-        return NULL;
+    int client = (intptr_t)arg;
+    recvdata_t recvdata = {'\0', '\0', 0, '\0'};
+    if (get_command(client, &recvdata) < 0) {
+        fprintf(stderr, "accept_request:get_command error");
+        close(client);
+        return;
     }
-    if (strncmp("GET", recvdata.method, 3) && strncmp("POST", recvdata.method, 4)) {
-        fprintf(stderr, "accept_request:recvdata.method error");
-        return NULL;
+    if (strncasecmp("GET", recvdata.method, 3) && strncasecmp("POST", recvdata.method, 4)) {
+        close(client);
+        return;
     }
-    sprintf(path, "htdocs%s", recvdata.url);
-    if (!strncmp("POST", recvdata.method, 4)) {
-        if (get_data_length(fd, &recvdata) < 0) {
-            fprintf(stderr, "accept_request:get_data_length error");
-            return NULL;
-        }
-        if (get_recv_data(fd, &recvdata) < 0) {
-            fprintf(stderr, "accept_request:get_recv_data error");
-            return NULL;
-        }
-        
-        char *info = "HTTP/1.0 200 OK\r\n"; 
-        send(fd, info, strlen(info), 0);
-        if (send_cgi_file(fd, path, &recvdata) < 0) {
-            fprintf(stderr, "accept_request:send_html_file error");
-            return NULL;
-        }
+    if (get_data(client, &recvdata) < 0) {
+        fprintf(stderr, "accept_request:get_data error");
+        close(client);
+        return;
+    }
+    if (!strncasecmp("GET", recvdata.method, 3)) {
+        set_html_file(client, &recvdata);
     } else {
-        if (discard_recv_data(fd) < 0) {
-            fprintf(stderr, "accept_request:discard_recv_data error");
-            return NULL;
-        }
-        send_header(fd);
-        if (send_html_file(fd, path) < 0) {
-            fprintf(stderr, "accept_request:send_html_file error");
-            return NULL;
-        }
+        set_cgi_file(client, &recvdata);
     }
-    close(fd);
-    if (recvdata.method) {
-        free(recvdata.method);
-    }
-    if (recvdata.url) {
-        free(recvdata.url);
-    }
-    if (recvdata.data) {
-        free(recvdata.data);
-    }
-    return NULL;
+    close(client);
 }
 
-static int send_header(int fd)
+static size_t get_line(int client, char *buf, int len)
 {
-    char *info = "HTTP/1.1 200 OK\r\nHost:shm\r\nContent-type:text/html\r\n\r\n";
-    size_t info_len = strlen(info);
-    send(fd, info, info_len, 0);
+    char chr = '\0';
+    int n = 1;
+    int i = 0;
+    while (chr != '\n' && i < len-1) {
+        n = recv(client, &chr, 1, 0);
+        if (n > 0) {
+            if (chr == '\r') {
+                n = recv(client, &chr, 1, 0);
+                if (chr != '\n') {
+                    chr = '\n';
+                }
+            }
+            buf[i] = chr;
+            i++;
+        } else {
+            chr = '\n';
+            return -1;
+        }
+    }
+    buf[i] = '\0';
+    return i;
+}
+
+static int get_data(int client, recvdata_t *recvdata)
+{
+    char buf[BUF_LEN_512B] = {'\0'};
+    char *info = "Content-length:";
+    int info_len = strlen(info);
+    int numchars = 1;
+    int i;
+    if (!strncasecmp("GET", recvdata->method, 3)) {
+        while (strncasecmp("\n", buf, 1) && numchars > 0) {
+            numchars = get_line(client, buf, BUF_LEN_512B);
+        }
+        return 0;
+    }
+    while (strncasecmp(info, buf, info_len) && numchars > 0) {
+        numchars = get_line(client, buf, BUF_LEN_512B);
+    }
+    if (numchars <= 0) {
+        return numchars;
+    }
+    recvdata->content_length = atoi(&buf[info_len]);
+    while (strncasecmp("\n", buf, 1) && numchars > 0) {
+        numchars = get_line(client, buf, BUF_LEN_512B);
+    }
+    if (numchars <= 0) {
+        return numchars;
+    }
+    numchars = recv(client, recvdata->data, recvdata->content_length, 0);
+    recvdata->data[recvdata->content_length] = '\0';
     return 0;
 }
 
-static int send_html_file(int fd, char *path)
+static int get_command(int client, recvdata_t *recvdata)
 {
-    char buf[BUF_MAX_LEN] = {'\0'};
-    int fp = -1;
-    int ret = -1;
-    if ((fp = open(path, O_RDONLY)) < 0) {
-        perror("send_html_file: open error");
-        return ERR_API;
+    char buf[BUF_LEN_1KB] = {'\0'};
+    int numchars = get_line(client, buf, BUF_LEN_1KB);
+    int i, j;
+    if (numchars < 0) {
+        return numchars;
     }
-    if ((ret = read(fp, buf, BUF_MAX_LEN)) > 0) {
-        send(fd, buf, ret, 0);
+    for (i = 0; i < BUF_LEN_10B && i < numchars; i++) {
+        if (buf[i] == ' ')break;
+        recvdata->method[i] = buf[i];
+    }
+    recvdata->method[i] = '\0';
+    for (j = 0, i += 1; j < BUF_LEN_1KB && i < numchars; i++, j++) {
+        if (buf[i] == ' ')break;
+        recvdata->url[j] = buf[i];
+    }
+    recvdata->url[j] = '\0';
+    if (recvdata->url[j-1] == '/') {
+        strncat(recvdata->url, "index.html", 10);
+    }
+    return 0;
+}
+
+static int set_html_file(int client, recvdata_t *recvdata)
+{
+    int fp = -1;
+    char path[BUF_LEN_512B] = {'\0'};
+    char buf[BUF_LEN_1KB] = {'\0'};
+    char *info = "HTTP/1.1 200 OK\r\nHost:shm\r\nContent-type:text/html\r\n\r\n"; 
+    int numchars = 0;
+    sprintf(path, "htdocs%s", recvdata->url);
+    if ((fp = open(path, O_RDONLY)) < 0) {
+        perror("open error");
+        return -1;
+    }
+    send(client, info, strlen(info), 0);
+    while ((numchars = read(fp, buf, BUF_LEN_1KB)) > 0) {
+        send(client, buf, numchars, 0);
     }
     close(fp);
     return 0;
 }
 
-static int send_cgi_file(int fd, char *path, recvdata_t *rdata)
+static int set_cgi_file(int client, recvdata_t *recvdata)
 {
-    pid_t pid;
-    int input[2];
-    char buf[BUF_MAX_LEN] = {'\0'};
-    int ret = -1;
-    if (pipe(input) < 0 ) {
-        perror("send_cgi_file: pipe error");
-        return ERR_API;
+    int fp = -1;
+    char path[BUF_LEN_512B] = {'\0'};
+    char buf[BUF_LEN_1KB] = {'\0'};
+    char *info = "HTTP/1.1 200 OK\r\n"; 
+    int numchars = 0;
+    int output[2];
+    int pid = -1;
+    sprintf(path, "htdocs%s", recvdata->url);
+    if ((fp = open(path, O_RDONLY)) < 0) {
+        perror("open error");
+        return -1;
+    }
+    close(fp);
+    if (pipe(output) < 0) {
+        perror("pipe error");
+        return -1;
     }
     pid = fork();
-    if (pid == 0) { // child
-        close(input[0]);
-        dup2(input[1], STDOUT);
-        sprintf(buf, "REQUEST_METHOD=%s", rdata->method); 
+    if (pid == 0) {
+        close(output[0]);
+        dup2(output[1], STDOUT);
+        sprintf(buf, "REQUEST_METHOD=%s", recvdata->method);
         putenv(buf);
-        sprintf(buf, "CONTENT_LENGTH=%d", rdata->content_length); 
+        sprintf(buf, "CONTENT_LENGTH=%d", recvdata->content_length);
         putenv(buf);
-        execl(path, rdata->url, rdata->data, NULL);
+        execl(path, recvdata->url, recvdata->data, NULL);
         exit(0);
     } else {
-        close(input[1]);
-        while ((ret = read(input[0], buf, BUF_MAX_LEN)) > 0) {
-            send(fd, buf, ret, 0);
+        close(output[1]);
+        send(client, info, strlen(info), 0);
+        while ((numchars = read(output[0], buf, BUF_LEN_1KB)) > 0) {
+            send(client, buf, numchars, 0);
         }
-        waitpid(pid, NULL, 0);
+        close(output[0]);
+        waitpid(&pid, NULL, 0);
     }
-    return 0;
-}
-
-static int get_request(int fd, recvdata_t *rdata)
-{
-    char buf[BUF_MAX_LEN] = {'\0'};
-    char *method = NULL;
-    char *url = NULL;
-    char *ptr = NULL;
-    ssize_t numchars = -1;
-    int i = 0;
-    numchars = get_recv_line(fd, buf, BUF_MAX_LEN);
-    if (numchars < 0) {
-        return numchars;
-    }
-    
-    method = (char *)malloc(METHOD_MAX_LEN);
-    if (!method) {
-        perror("get_request: malloc error");
-        return ERR_API;
-    }
-    rdata->method = method;
-    
-    url = (char *)malloc(URL_MAX_LEN);
-    if (!url) {
-        perror("get_request: malloc error");
-        free(method);
-        return ERR_API;
-    }
-    rdata->url = url;
-    
-    ptr = buf;
-    for (i = 0; i < (METHOD_MAX_LEN-1) && ptr < (buf+numchars); i++) {
-        if (ptr[i] == ' ') {
-            break;
-        }
-        method[i] = ptr[i];
-    }
-    method[i] = '\0';
-    
-    ptr = &buf[i+1];
-    for (i = 0; i < (URL_MAX_LEN-1) && ptr < (buf+numchars); i++) {
-        if (ptr[i] == ' ') {
-            break;
-        }
-        url[i] = ptr[i];
-    }
-    url[i] = '\0';
-    if (url[i-1] == '/') {
-        strncat(url, "index.html", 10);
-    }
-    return 0;
-}
-
-static int get_data_length(int fd, recvdata_t *rdata)
-{
-    char buf[BUF_MAX_LEN] = {'\0'};
-    char *length_chr = "Content-Length:";
-    size_t length_len = strlen(length_chr);
-    size_t content_length = 0;
-    ssize_t numchars = -1;
-    while ((numchars = get_recv_line(fd, buf, BUF_MAX_LEN)) > 0 && strncmp(buf, "\n", 1)) {
-        if (strncmp(length_chr, buf, length_len)) {
-            continue;
-        }
-        content_length = atoi(&buf[length_len]);
-    }
-    if (numchars < 0) {
-        return numchars;
-    }
-    rdata->content_length = content_length;
-    return 0;
-}
-
-static int get_recv_data(int fd, recvdata_t *rdata)
-{
-    char *data = NULL;
-    char chr;
-    size_t chrlen = sizeof(chr);
-    ssize_t ret = -1;
-    ssize_t k = 0;
-    
-    data = (char *)malloc(rdata->content_length+1);
-    if (!data) {
-        perror("get_data: malloc error");
-        return ERR_API;
-    }
-    while (k < (rdata->content_length) && (ret = recv(fd, &chr, chrlen, 0)) > 0) {
-        data[k++] = chr;
-    }
-    data[k] = '\0';
-    if (ret < 0) {
-        free(data);
-        perror("get_recv_data: recv error");
-        return ERR_API;
-    } else if (ret == 0) {
-        free(data);
-        fprintf(stderr, "get_recv_data:client close");
-        return ERR_CLIENT_CLOSE;
-    }
-    rdata->data = data;
-    return 0;
-}
-
-// 数组太小导致未接受到一行呢？
-static ssize_t get_recv_line(int fd, char *buf, size_t len)
-{
-    char chr;
-    size_t chrlen = sizeof(chr);
-    ssize_t ret = -1;
-    ssize_t k = 0;
-    
-    while ((ret = recv(fd, &chr, chrlen, 0)) > 0 && k < (len-1)) {
-        if (chr == '\r') {
-            ret = recv(fd, &chr, chrlen, 0);
-            buf[k++] = chr;
-            break;
-        }
-        buf[k++] = chr;
-    }
-    buf[k] = '\0';
-    if (ret < 0) {
-        perror("get_recv_line: recv error");
-        return ERR_API;
-    } else if (ret == 0) {
-        fprintf(stderr, "get_recv_line:client close");
-        return ERR_CLIENT_CLOSE;
-    }
-    return (k+1);
-}
-
-static int discard_recv_data(int fd)
-{
-    char buf[BUF_MAX_LEN] = {'\0'};
-    int ret = -1;
-    size_t len = BUF_MAX_LEN;
-    
-    while ((ret = get_recv_line(fd, buf, len)) > 0 && strncmp(buf, "\n", 1));
-    if (ret < 0) {
-        perror("discard_recv_data: get_recv_line error");
-        return ERR_API;
-    } else if (ret == 0) {
-        fprintf(stderr, "discard_recv_data:client close");
-        return ERR_CLIENT_CLOSE;
-    }
-    return SERVER_OK;
 }
 
 static int startup(int port)
@@ -345,3 +250,4 @@ static int startup(int port)
     }
     return sockfd;
 }
+
